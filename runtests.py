@@ -17,19 +17,26 @@ import marionette
 import mozprocess
 from mozprofile.profile import Profile
 from mozrunner import FirefoxRunner
+import mozlog
+
+logger = mozlog.getLogger("web-platform-tests")
+logger.setLevel(mozlog.DEBUG)
 
 DEFAULT_TIMEOUT = 20 #seconds
 
 #TODO
-# reftests
+# reftest details (window size+ lots more)
 # logging
 # Documentation
 # better status report
 # correct output format
 # webdriver tests
+# HTTP server crashes
+# Expected test results
 
 class HttpServer(mozprocess.ProcessHandlerMixin):
-    def __init__(self, path, test_root, host="127.0.0.1", port=8000):
+    def __init__(self, path, test_root, host="127.0.0.1", port=8000,
+                 **kwargs):
         """HTTP Server process.
 
         :param path: Path to the server binary
@@ -41,7 +48,8 @@ class HttpServer(mozprocess.ProcessHandlerMixin):
         self.host = host
         self.port = port
         
-        mozprocess.ProcessHandlerMixin.__init__(self, path, self.get_args())
+        mozprocess.ProcessHandlerMixin.__init__(self, path, self.get_args(),
+                                                **kwargs)
 
     def get_args(self):
         return [self.test_root,
@@ -57,7 +65,8 @@ class HttpServerManager(object):
     def __init__(self, binary_path, test_path, host="127.0.0.1", port=8000):
         self.host = host
         self.port = port
-        self.proc = HttpServer(binary_path, test_path, host, port)
+        self.proc = HttpServer(binary_path, test_path, host, port,
+                               stderr=sys.stderr)
         self.timeout = 10
 
     def start(self):
@@ -98,19 +107,39 @@ def start_http_server(http_server_path, test_path):
         sys.exit(1)
     return server_manager
 
+def get_free_port(start_port, exclude=None):
+    port = start_port
+    while True:
+        if exclude and port in exclude:
+            port += 1
+            continue
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", port))
+        except socket.error:
+            port += 1
+        else:
+            return port
+        finally:
+            s.close()
 
 class TestRunner(object):
-    def __init__(self, http_server_url, command_pipe, marionette_port=2828):
+    def __init__(self, http_server_url, command_pipe, marionette_port=None):
         self.http_server_url = http_server_url
         self.command_pipe = command_pipe
+        if marionette_port is None:
+            marionette_port = get_free_port(2828)
         self.marionette_port = marionette_port
         self.timer = None
+        self.logger = mozlog.getLogger("WPT Testrunner %i" % id(self))
 
     def setup(self):
+        logger.debug("Connecting to marionette on port %i" % self.marionette_port)
         #Supporting multiple processes requires a choice of ports here
         self.browser = marionette.Marionette(host='localhost', port=self.marionette_port)
         self.browser.wait_for_port()
         self.browser.start_session()
+        logger.debug("Marionette session started")
     
     def teardown(self):
         self.command_pipe.close()
@@ -129,11 +158,11 @@ class TestRunner(object):
         finally:
             self.teardown()
 
-    def run_test(self, url):
+    def run_test(self, test):
         assert len(self.browser.window_handles) == 1
 
         def timeout_func():
-            self.send_message("timeout", url)
+            self.send_message("timeout", test)
 
         self.timer = threading.Timer(DEFAULT_TIMEOUT + 10, timeout_func)
         self.timer.start()
@@ -142,7 +171,7 @@ class TestRunner(object):
         self.browser.set_script_timeout(DEFAULT_TIMEOUT * 1000)
 
         try:
-            result = self.do_test(url)
+            result = self.do_test(test)
         except marionette.errors.ScriptTimeoutException:
             result = {"status":"TIMEOUT", "tests": None}
             #Clean up any unclosed windows
@@ -160,7 +189,7 @@ class TestRunner(object):
                 else:
                     break
             #Now need to check if the browser is still responsive and restart it if not
-        except marionette.errors.InvalidResponseException:
+        except (socket.timeout, marionette.errors.InvalidResponseException):
             #This can happen on a crash
             #XXX Maybe better to have a specific crash message?
             #Also, should check after the test if the firefox process is still running
@@ -168,7 +197,7 @@ class TestRunner(object):
             result = {"status":"CRASH", "tests": None}
         finally:
             self.timer.cancel()
-        self.send_message("test_ended", url, result)
+        self.send_message("test_ended", test, result)
 
     def do_test(self, test):
         raise NotImplementedError
@@ -176,8 +205,6 @@ class TestRunner(object):
     def send_message(self, command, *args):
         self.command_pipe.send((command, args))
 
-    def timeout(self):
-        self.send_message("timeout", url)
 
 
 class TestharnessTestRunner(TestRunner):
@@ -236,9 +263,11 @@ class ReftestTestRunner(TestRunner):
         print "In total %i screnshots could be avoided" % count
         TestRunner.teardown(self)
 
-def start_runner(runner_cls, http_server_url, command_pipe):
-    runner = runner_cls(http_server_url, command_pipe)
+
+def start_runner(runner_cls, http_server_url, marionette_port, command_pipe):
+    runner = runner_cls(http_server_url, command_pipe, marionette_port=marionette_port)
     runner.run()
+
 
 
 class TestRunnerManager(threading.Thread):
@@ -246,7 +275,8 @@ class TestRunnerManager(threading.Thread):
     by the TestRunner (e.g. the Firefox binary)"""
 
     def __init__(self, server_url, firefox_binary, tests_queue, results_queue,
-                 stop_flag, runner_cls=TestharnessTestRunner):
+                 stop_flag, runner_cls=TestharnessTestRunner,
+                 marionette_port=None):
         self.http_server_url = server_url
         self.firefox_binary = firefox_binary
         self.tests_queue = tests_queue
@@ -256,6 +286,7 @@ class TestRunnerManager(threading.Thread):
         self.firefox_runner = None
         self.test_runner_proc = None
         self.runner_cls = runner_cls
+        self.marionette_port = marionette_port
         threading.Thread.__init__(self)
 
     def run(self):
@@ -294,7 +325,7 @@ class TestRunnerManager(threading.Thread):
 
         profile = Profile()
         profile.set_preferences({"marionette.defaultPrefs.enabled": True,
-                                 "marionette.defaultPrefs.port": 2828,
+                                 "marionette.defaultPrefs.port": self.marionette_port,
                                  "dom.disable_open_during_load": False})
 
         self.firefox_runner = FirefoxRunner(profile,
@@ -307,6 +338,7 @@ class TestRunnerManager(threading.Thread):
         self.test_runner_proc = Process(target=start_runner,
                                         args=(self.runner_cls,
                                               self.http_server_url,
+                                              self.marionette_port,
                                               remote_connection))
         self.test_runner_proc.start()
 
@@ -345,6 +377,48 @@ class TestRunnerManager(threading.Thread):
         self.stop_runner(graceful=False)
         self.init()
 
+class ManagerPool(object):
+    def __init__(self, runner_cls, size, server_url, binary_path):
+        self.server_url = server_url
+        self.binary_path = binary_path
+        self.size = size
+        self.runner_cls = runner_cls
+        self.pool = set()
+        #Event that is polled by threads so that they can gracefully exit in the face
+        #of sigint
+        self.stop_flag = threading.Event()
+        signal.signal(signal.SIGINT, get_signal_handler(self))
+
+    def start(self, tests_queue):
+        results_queue = Queue()
+        used_ports = set()
+        logger.debug("Using %i processes" % self.size)
+        for i in range(self.size):
+            print i
+            marionette_port = get_free_port(2828, exclude=used_ports)
+            print marionette_port
+            used_ports.add(marionette_port)
+            manager = TestRunnerManager(self.server_url,
+                                        self.binary_path, 
+                                        tests_queue,
+                                        results_queue,
+                                        self.stop_flag,
+                                        runner_cls=self.runner_cls,
+                                        marionette_port=marionette_port)
+            manager.start()
+            self.pool.add(manager)
+            print "Started %i" % i
+        return results_queue
+
+    def is_alive(self):
+        for manager in self.pool:
+            if manager.is_alive():
+                return True
+        return False
+
+    def stop(self):
+        self.stop_flag.set()
+        
 
 def queue_tests(test_root, test_path, test_types):
     sys.path.insert(0, os.path.join(test_root, "tools", "scripts"))
@@ -402,15 +476,17 @@ def parse_args():
                         help="Test types to run")
     parser.add_argument("--test", action="store", type=abs_path,
                         help="Path to specific test folder or manifest to use")
+    parser.add_argument("--processes", action="store", type=int, default=1,
+                        help="Number of simultaneous processes to use")
     rv = parser.parse_args()
     if rv.test is None:
         rv.test = rv.tests_root
     return rv
 
 
-def get_signal_handler(stop_flag, server_manager):
+def get_signal_handler(manager_pool):
     def sig_handler(signum, frame):
-        stop_flag.set()
+        manager_pool.stop()
     return sig_handler
 
 test_runner_classes = {"reftest": ReftestTestRunner,
@@ -423,13 +499,7 @@ def main():
 
     server_manager = start_http_server(args.server, args.tests_root)
 
-    results_queue = Queue()
     test_queues = queue_tests(args.tests_root, args.test, args.test_types)
-
-    #Event that is polled by threads so that they can gracefully exit in the face
-    #of sigint
-    stop_flag = threading.Event()
-    signal.signal(signal.SIGINT, get_signal_handler(stop_flag, server_manager))
 
     
     print "Running %i test files" % reduce(lambda x, y: x + y.qsize(), test_queues.itervalues(), 0)
@@ -439,18 +509,14 @@ def main():
             tests_queue = test_queues[test_type]
             runner_cls = test_runner_classes[test_type]
             try:
-                manager = TestRunnerManager(server_manager.proc.url,
-                                            args.binary, 
-                                            tests_queue,
-                                            results_queue,
-                                            stop_flag,
-                                            runner_cls=runner_cls)
-                manager.start()
+                pool = ManagerPool(runner_cls, args.processes, server_manager.proc.url,
+                                   args.binary)
+                results_queue = pool.start(tests_queue)
                 while True:
                     try:
                         result = results_queue.get(True, 1)
                     except Empty:
-                        if not manager.is_alive():
+                        if not pool.is_alive():
                             break
                     else:
                         f.write(json.dumps(result) + ",\n")
@@ -458,7 +524,7 @@ def main():
                 server_manager.stop()
         f.write("]")
 
-    if not stop_flag.is_set():
+    
         print "Took %d" % (time.time() - t0)
 
 if __name__ == "__main__":
