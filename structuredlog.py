@@ -6,6 +6,27 @@ import mozlog
 
 loggers = {}
 
+#An alternate proposal for logging:
+#Allowed actions, and subfields:
+#  TESTS-START
+#  TESTS-END
+#  TEST-START
+#      test
+#  TEST-END
+#      test
+#      status [OK | ERROR | TIMEOUT | CRASH | ASSERT?]
+#      unexpected [True | not given]
+#  TEST-RESULT
+#      test
+#      subtest
+#      status [PASS | FAIL | TIMEOUT | NOTRUN ]
+#      unexpected [True | not given]
+#  OUTPUT
+#      line
+#  LOG
+#      level
+#      message
+
 def getLogger(name, handler=None):
     if name not in loggers:
         loggers[name] = mozlog.getLogger(name, handler)
