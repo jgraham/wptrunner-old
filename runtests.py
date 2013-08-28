@@ -5,22 +5,22 @@ import urlparse
 import time
 import json
 from Queue import Queue, Empty
+import multiprocessing
 from multiprocessing import Process, Pipe
 import threading
 import urllib2
 import socket
 import signal
 import hashlib
-from collections import defaultdict
+from collections import defaultdict, deque
 
 import marionette
 import mozprocess
 from mozprofile.profile import Profile
 from mozrunner import FirefoxRunner
-import mozlog
 
-logger = mozlog.getLogger("web-platform-tests")
-logger.setLevel(mozlog.DEBUG)
+import mozlog
+import structuredlog
 
 DEFAULT_TIMEOUT = 20 #seconds
 
@@ -33,6 +33,26 @@ DEFAULT_TIMEOUT = 20 #seconds
 # webdriver tests
 # HTTP server crashes
 # Expected test results
+
+log_handler = mozlog.StreamHandler()
+log_handler.setFormatter(mozlog.JSONFormatter())
+logger = structuredlog.getLogger("WPT", handler=log_handler)
+logger.setLevel(mozlog.DEBUG)
+
+def make_wrapper(cmd, cmd_args):
+    class WrappedCommand(type):
+        def __call__(cls, *args, **kwargs):
+            all_args = ([cmd] + cmd_args + args[0],) + args[1:]
+            return super(WrappedCommand, cls).__call__(*all_args, **kwargs)
+
+    def inner(cls):
+        class Command(cls):
+            __metaclass__ = WrappedCommand
+        return Command
+
+    return inner
+
+XvfbWrapped = make_wrapper("xvfb-run", ["-a", "--server-args=+extension RANDR -screen 0 800x600x24"])
 
 class HttpServer(mozprocess.ProcessHandlerMixin):
     def __init__(self, path, test_root, host="127.0.0.1", port=8000,
@@ -80,7 +100,7 @@ class HttpServerManager(object):
             return False
         except urllib2.HTTPError:
             return True
-        except urllib2.URLError, e:
+        except urllib2.URLError:
             return False
         return True
 
@@ -107,6 +127,7 @@ def start_http_server(http_server_path, test_path):
         sys.exit(1)
     return server_manager
 
+
 def get_free_port(start_port, exclude=None):
     port = start_port
     while True:
@@ -123,6 +144,7 @@ def get_free_port(start_port, exclude=None):
         finally:
             s.close()
 
+
 class TestRunner(object):
     def __init__(self, http_server_url, command_pipe, marionette_port=None):
         self.http_server_url = http_server_url
@@ -131,7 +153,6 @@ class TestRunner(object):
             marionette_port = get_free_port(2828)
         self.marionette_port = marionette_port
         self.timer = None
-        self.logger = mozlog.getLogger("WPT Testrunner %i" % id(self))
 
     def setup(self):
         logger.debug("Connecting to marionette on port %i" % self.marionette_port)
@@ -147,7 +168,7 @@ class TestRunner(object):
 
     def run(self):
         self.setup()
-        commands = {"run_test":self.run_test}
+        commands = {"run_test": self.run_test}
         try:
             while True:
                 command, args = self.command_pipe.recv()
@@ -161,8 +182,19 @@ class TestRunner(object):
     def run_test(self, test):
         assert len(self.browser.window_handles) == 1
 
+        #Lock to prevent races between timeouts and other results
+        #This might not be strictly necessary if we need to deal
+        #with the result changing post-hoc anyway (e.g. due to detecting
+        #a crash after we get the data back from marionette)
+        result = None
+        result_flag = threading.Event()
+        result_lock = threading.Lock()
+
         def timeout_func():
-            self.send_message("timeout", test)
+            with result_lock:
+                if not result_flag.is_set():
+                    result_flag.set()
+                    self.send_message("timeout", test)
 
         self.timer = threading.Timer(DEFAULT_TIMEOUT + 10, timeout_func)
         self.timer.start()
@@ -173,7 +205,10 @@ class TestRunner(object):
         try:
             result = self.do_test(test)
         except marionette.errors.ScriptTimeoutException:
-            result = {"status":"TIMEOUT", "tests": None}
+            with result_lock:
+                if not result_flag.is_set():
+                    result_flag.set()
+                    result = {"status":"TIMEOUT", "tests": []}
             #Clean up any unclosed windows
             #This doesn't account for the possibility the browser window
             #is totally hung. That seems less likely since we are still
@@ -194,17 +229,22 @@ class TestRunner(object):
             #XXX Maybe better to have a specific crash message?
             #Also, should check after the test if the firefox process is still running
             #and otherwise ignore any other result and set it to crash
-            result = {"status":"CRASH", "tests": None}
+            with result_lock:
+                if not result_flag.is_set():
+                    result_flag.set()
+                    result = {"status":"CRASH", "tests": []}
         finally:
             self.timer.cancel()
-        self.send_message("test_ended", test, result)
+
+        with result_lock:
+            if result:
+                self.send_message("test_ended", test, result)
 
     def do_test(self, test):
         raise NotImplementedError
 
     def send_message(self, command, *args):
         self.command_pipe.send((command, args))
-
 
 
 class TestharnessTestRunner(TestRunner):
@@ -269,6 +309,20 @@ def start_runner(runner_cls, http_server_url, marionette_port, command_pipe):
     runner.run()
 
 
+def get_test_status(test, subtest, status_code):
+    return {0: "PASS",
+            1: "FAIL",
+            2: "TIMEOUT",
+            3: "NOTRUN"}[status_code]
+
+def get_harness_status(test, status_code):
+    codes = {0: "OK",
+             1: "ERROR",
+             2: "TIMEOUT"}
+    return codes.get(status_code, status_code)
+
+class FirefoxProcess(mozprocess.ProcessHandlerMixin):
+    pass
 
 class TestRunnerManager(threading.Thread):
     """Thread that owns a single TestRunner process and any processes required
@@ -276,7 +330,7 @@ class TestRunnerManager(threading.Thread):
 
     def __init__(self, server_url, firefox_binary, tests_queue, results_queue,
                  stop_flag, runner_cls=TestharnessTestRunner,
-                 marionette_port=None):
+                 marionette_port=None, process_cls=FirefoxProcess):
         self.http_server_url = server_url
         self.firefox_binary = firefox_binary
         self.tests_queue = tests_queue
@@ -287,7 +341,10 @@ class TestRunnerManager(threading.Thread):
         self.test_runner_proc = None
         self.runner_cls = runner_cls
         self.marionette_port = marionette_port
+        self.process_cls = process_cls
         threading.Thread.__init__(self)
+        #This should possibly buffer the output
+        self.logger = structuredlog.getLogger("WPT")
 
     def run(self):
         self.init()
@@ -326,15 +383,20 @@ class TestRunnerManager(threading.Thread):
         profile = Profile()
         profile.set_preferences({"marionette.defaultPrefs.enabled": True,
                                  "marionette.defaultPrefs.port": self.marionette_port,
-                                 "dom.disable_open_during_load": False})
+                                 "dom.disable_open_during_load": False,
+                                 "dom.max_script_runtime": 0})
 
         self.firefox_runner = FirefoxRunner(profile,
                                             self.firefox_binary,
                                             cmdargs=["--marionette"],
-                                            env=env)
+                                            env=env,
+                                            kp_kwargs = {"processOutputLine":[self.on_output]},
+                                            process_class=self.process_cls)
+        self.logger.debug("Starting Firefox")
         self.firefox_runner.start()
 
     def start_test_runner(self, remote_connection):
+        self.logger.debug("Starting test runner")
         self.test_runner_proc = Process(target=start_runner,
                                         args=(self.runner_cls,
                                               self.http_server_url,
@@ -346,6 +408,7 @@ class TestRunnerManager(threading.Thread):
         self.command_pipe.send((command, args))
 
     def stop_runner(self, graceful=True):
+        self.logger.debug("Stopping runner")
         if graceful:
             self.test_runner_proc.join(10)
             if self.test_runner_proc.is_alive():
@@ -353,6 +416,7 @@ class TestRunnerManager(threading.Thread):
         self.firefox_runner.stop()
         if not graceful:
             self.test_runner_proc.terminate()
+        self.logger.flush()
         self.command_pipe.close()
 
     def start_next_test(self):
@@ -361,28 +425,56 @@ class TestRunnerManager(threading.Thread):
         except Empty:
             self.send_message("stop")
         else:
+            self.logger.testStart({"test":test}, buffer=True)
             self.send_message("run_test", test)
 
-    def test_ended(self, url, results):
-        self.results_queue.put((url, results))
+    def test_ended(self, test, results):
+        #It would be nice to move this down into the runner
+        for result in results["tests"]:
+            status = get_test_status(test, result["name"], result["status"])
+
+            log_func = self.logger.testPass if status == "PASS" else self.logger.testFail
+            log_func({"test":test,
+                      "subtest":result["name"],
+                      "status":status}, buffer=True)
+        self.results_queue.put((test, results))
+
+        harness_status = get_harness_status(test, results["status"])
+        #This just uses the harness status, not the status of any subtests
+        log_func = {"OK": self.logger.testPass,
+                    "ERROR": self.logger.testFail,
+                    "TIMEOUT": self.logger.testFail,
+                    "CRASH": self.logger.processCrash}[harness_status]
+        log_func({"test": test,
+                  "status": harness_status})
+        self.logger.testEnd({"test": test}, buffer=True)
+        self.logger.flush()
         if results["status"] == "CRASH":
             self.restart_runner()
         self.start_next_test()
 
-    def timeout(self, test_id):
-        self.results_queue.put((test_id, {"status":"TIMEOUT", "tests":None}))
+    def timeout(self, test):
+        self.results_queue.put((test, {"status":"TIMEOUT", "tests":[]}))
+        self.logger.testEnd({"test":test,
+                             "status":"TIMEOUT"}, buffer=True)
+        self.logger.flush()
         self.restart_runner()
 
     def restart_runner(self):
         self.stop_runner(graceful=False)
         self.init()
 
+    def on_output(self, line):
+        self.logger.info({"subaction":"firefox-output", "msg":line})
+
 class ManagerPool(object):
-    def __init__(self, runner_cls, size, server_url, binary_path):
+    def __init__(self, runner_cls, size, server_url, binary_path,
+                 process_cls=FirefoxProcess):
         self.server_url = server_url
         self.binary_path = binary_path
         self.size = size
         self.runner_cls = runner_cls
+        self.process_cls = process_cls
         self.pool = set()
         #Event that is polled by threads so that they can gracefully exit in the face
         #of sigint
@@ -394,9 +486,7 @@ class ManagerPool(object):
         used_ports = set()
         logger.debug("Using %i processes" % self.size)
         for i in range(self.size):
-            print i
             marionette_port = get_free_port(2828, exclude=used_ports)
-            print marionette_port
             used_ports.add(marionette_port)
             manager = TestRunnerManager(self.server_url,
                                         self.binary_path, 
@@ -404,10 +494,10 @@ class ManagerPool(object):
                                         results_queue,
                                         self.stop_flag,
                                         runner_cls=self.runner_cls,
-                                        marionette_port=marionette_port)
+                                        marionette_port=marionette_port,
+                                        process_cls=self.process_cls)
             manager.start()
             self.pool.add(manager)
-            print "Started %i" % i
         return results_queue
 
     def is_alive(self):
@@ -478,6 +568,8 @@ def parse_args():
                         help="Path to specific test folder or manifest to use")
     parser.add_argument("--processes", action="store", type=int, default=1,
                         help="Number of simultaneous processes to use")
+    parser.add_argument("--xvfb", action="store_true",
+                        help="Run processes that require the display under xvfb")
     rv = parser.parse_args()
     if rv.test is None:
         rv.test = rv.tests_root
@@ -486,6 +578,7 @@ def parse_args():
 
 def get_signal_handler(manager_pool):
     def sig_handler(signum, frame):
+        logger.info({"action":"Got interrupt"})
         manager_pool.stop()
     return sig_handler
 
@@ -502,15 +595,20 @@ def main():
     test_queues = queue_tests(args.tests_root, args.test, args.test_types)
 
     
-    print "Running %i test files" % reduce(lambda x, y: x + y.qsize(), test_queues.itervalues(), 0)
+    logger.debug("Running %i test files" % reduce(lambda x, y: x + y.qsize(), test_queues.itervalues(), 0))
     with open("results.json", "w") as f:
         f.write("[\n")
         for test_type in args.test_types:
             tests_queue = test_queues[test_type]
             runner_cls = test_runner_classes[test_type]
+
+            process_cls = FirefoxProcess
+            if args.xvfb:
+                process_cls = XvfbWrapped(process_cls)
+
             try:
                 pool = ManagerPool(runner_cls, args.processes, server_manager.proc.url,
-                                   args.binary)
+                                   args.binary, process_cls=process_cls)
                 results_queue = pool.start(tests_queue)
                 while True:
                     try:
@@ -523,9 +621,8 @@ def main():
             finally:
                 server_manager.stop()
         f.write("]")
-
     
-        print "Took %d" % (time.time() - t0)
+        logger.info({"msg":"Harness finsihed", "duration":(time.time() - t0)})
 
 if __name__ == "__main__":
     main()
