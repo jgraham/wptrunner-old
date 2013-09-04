@@ -13,14 +13,17 @@ import socket
 import signal
 import hashlib
 from collections import defaultdict, deque
+import pstats
+import cProfile
 
 import marionette
 import mozprocess
 from mozprofile.profile import Profile
 from mozrunner import FirefoxRunner
+import mozinfo
 
-import mozlog
 import structuredlog
+import expected
 
 DEFAULT_TIMEOUT = 20 #seconds
 
@@ -34,10 +37,8 @@ DEFAULT_TIMEOUT = 20 #seconds
 # HTTP server crashes
 # Expected test results
 
-log_handler = mozlog.StreamHandler()
-log_handler.setFormatter(mozlog.JSONFormatter())
-logger = structuredlog.getLogger("WPT", handler=log_handler)
-logger.setLevel(mozlog.DEBUG)
+stream_handler = structuredlog.StreamHandler()
+logger = structuredlog.getLogger("WPT", handlers=[stream_handler])
 
 def make_wrapper(cmd, cmd_args):
     class WrappedCommand(type):
@@ -54,6 +55,7 @@ def make_wrapper(cmd, cmd_args):
 
 XvfbWrapped = make_wrapper("xvfb-run", ["-a", "--server-args=+extension RANDR -screen 0 800x600x24"])
 
+
 class HttpServer(mozprocess.ProcessHandlerMixin):
     def __init__(self, path, test_root, host="127.0.0.1", port=8000,
                  **kwargs):
@@ -67,7 +69,7 @@ class HttpServer(mozprocess.ProcessHandlerMixin):
         self.test_root = test_root
         self.host = host
         self.port = port
-        
+
         mozprocess.ProcessHandlerMixin.__init__(self, path, self.get_args(),
                                                 **kwargs)
 
@@ -144,6 +146,96 @@ def get_free_port(start_port, exclude=None):
         finally:
             s.close()
 
+class RunInfo(object):
+    def __init__(self, debug):
+        self.platform = mozinfo.info
+        self.debug = debug
+
+
+class Test(object):
+    def __init__(self, url, expectations, timeout=None):
+        self.url = url
+        self.expectations = expectations
+        self.timeout = timeout
+
+    @property
+    def id(self):
+        return self.url
+
+    def disabled(self, run_info):
+        if "FILE" in self.expectations:
+            return "disabled" in self.expectations["FILE"]
+
+    def expected_file(self, run_info):
+        return self.expected_subtest(run_info, "FILE")
+
+    def expected_subtest(self, run_info, name):
+        if name in self.expectations:
+            return self.expectations[name].get("expected", "PASS").upper()
+        else:
+            return "PASS"
+
+    def disabled_subtest(self, run_info, name):
+        if name in self.expectations:
+            return "disabled" in self.expectations[name]
+
+    @classmethod
+    def from_json(cls, obj):
+        raise NotImplementedError
+
+class TestharnessTest(Test):
+    @property
+    def id(self):
+        return self.url
+
+class ReftestTest(Test):
+    def __init__(self, url, ref_url, ref_type, expectations, timeout=None):
+        self.url = url
+        self.ref_url = ref_url
+        if ref_type not in ("==", "!="):
+            raise ValueError
+        self.ref_type = ref_type
+        self.expectations = expectations
+        self.timeout = timeout
+
+    @property
+    def id(self):
+        return self.url, self.ref_type, self.ref_url
+
+def construct_test(manifest_test, expectations):
+    test_cls = {"reftest":ReftestTest,
+                "testharness":TestharnessTest}[manifest_test.item_type]
+    if test_cls == ReftestTest:
+        return test_cls(manifest_test.url,
+                        manifest_test.ref_url,
+                        manifest_test.ref_type,
+                        expectations,
+                        timeout=manifest_test.timeout)
+    else:
+        return test_cls(manifest_test.url,
+                        expectations,
+                        timeout=manifest_test.timeout)
+
+class HarnessResult(object):
+    statuses = set(["OK", "ERROR", "TIMEOUT", "CRASH"])
+
+    def __init__(self, status, message):
+        if status not in self.statuses:
+            raise ValueError("Unrecognised status %s" % status)
+        self.status = status
+        self.message = message
+
+
+class TestResult(object):
+    statuses = set(["PASS", "FAIL", "TIMEOUT", "NOTRUN"])
+
+    def __init__(self, name, status, message):
+        self.name = name
+        if status not in self.statuses:
+            raise ValueError("Unrecognised status %s" % status)
+        self.status = status
+        self.message = message
+
 
 class TestRunner(object):
     def __init__(self, http_server_url, command_pipe, marionette_port=None):
@@ -161,7 +253,7 @@ class TestRunner(object):
         self.browser.wait_for_port()
         self.browser.start_session()
         logger.debug("Marionette session started")
-    
+
     def teardown(self):
         self.command_pipe.close()
         #Close the marionette session
@@ -196,19 +288,21 @@ class TestRunner(object):
                     result_flag.set()
                     self.send_message("timeout", test)
 
-        self.timer = threading.Timer(DEFAULT_TIMEOUT + 10, timeout_func)
+        timeout = test.timeout if test.timeout else DEFAULT_TIMEOUT
+
+        self.timer = threading.Timer(timeout + 10, timeout_func)
         self.timer.start()
 
         self.browser.navigate("about:blank")
-        self.browser.set_script_timeout(DEFAULT_TIMEOUT * 1000)
+        self.browser.set_script_timeout(timeout * 1000)
 
         try:
-            result = self.do_test(test)
+            result = self.convert_result(self.do_test(test))
         except marionette.errors.ScriptTimeoutException:
             with result_lock:
                 if not result_flag.is_set():
                     result_flag.set()
-                    result = {"status":"TIMEOUT", "tests": []}
+                    result = (HarnessResult("TIMEOUT", None), [])
             #Clean up any unclosed windows
             #This doesn't account for the possibility the browser window
             #is totally hung. That seems less likely since we are still
@@ -232,7 +326,7 @@ class TestRunner(object):
             with result_lock:
                 if not result_flag.is_set():
                     result_flag.set()
-                    result = {"status":"CRASH", "tests": []}
+                    result = (HarnessResult("CRASH", None), [])
         finally:
             self.timer.cancel()
 
@@ -243,19 +337,36 @@ class TestRunner(object):
     def do_test(self, test):
         raise NotImplementedError
 
+    def convert_result(self):
+        raise NotImplementedError
+
     def send_message(self, command, *args):
         self.command_pipe.send((command, args))
 
 
 class TestharnessTestRunner(TestRunner):
+    harness_codes = {0: "OK",
+                     1: "ERROR",
+                     2: "TIMEOUT"}
+
+    test_codes = {0: "PASS",
+                  1: "FAIL",
+                  2: "TIMEOUT",
+                  3: "NOTRUN"}
+
     def __init__(self, *args, **kwargs):
         TestRunner.__init__(self, *args, **kwargs)
         self.script = open("testharness.js").read()
 
     def do_test(self, test):
-        url, = test
         return self.browser.execute_async_script(
-            self.script % urlparse.urljoin(self.http_server_url, url))
+            self.script % urlparse.urljoin(self.http_server_url, test.url))
+
+    def convert_result(self, result):
+        """Convert a JSON result into a (HarnessResult, [TestResult]) tuple"""
+        return (HarnessResult(self.harness_codes[result["status"]], result["message"]),
+                [TestResult(test["name"], self.test_codes[test["status"]],
+                            test["message"]) for test in result["tests"]])
 
 
 class ReftestTestRunner(TestRunner):
@@ -267,7 +378,7 @@ class ReftestTestRunner(TestRunner):
         self.ref_urls_by_hash = defaultdict(set)
 
     def do_test(self, test):
-        url, ref_type, ref_url = test
+        url, ref_type, ref_url = test.url, test.ref_type, test.ref_url
         hashes = {"test": None,
                   "ref": self.ref_hashes.get(ref_url)}
         for url_type, url in [("test", url), ("ref", ref_url)]:
@@ -291,8 +402,7 @@ class ReftestTestRunner(TestRunner):
         else:
             raise ValueError
 
-        return {"status":0, "tests":[{"status": 0 if passed else 1,
-                                      "name": None}]}
+        return "PASS" if passed else "FAIL"
 
     def teardown(self):
         count = 0
@@ -303,38 +413,32 @@ class ReftestTestRunner(TestRunner):
         print "In total %i screnshots could be avoided" % count
         TestRunner.teardown(self)
 
+    def convert_result(self, result):
+        """Convert a JSON result into a (HarnessResult, [TestResult]) tuple"""
+        return (HarnessResult("OK", None),
+                [TestResult("test", result, None)])
+
 
 def start_runner(runner_cls, http_server_url, marionette_port, command_pipe):
     runner = runner_cls(http_server_url, command_pipe, marionette_port=marionette_port)
     runner.run()
 
 
-def get_test_status(test, subtest, status_code):
-    return {0: "PASS",
-            1: "FAIL",
-            2: "TIMEOUT",
-            3: "NOTRUN"}[status_code]
-
-def get_harness_status(test, status_code):
-    codes = {0: "OK",
-             1: "ERROR",
-             2: "TIMEOUT"}
-    return codes.get(status_code, status_code)
-
 class FirefoxProcess(mozprocess.ProcessHandlerMixin):
     pass
+
 
 class TestRunnerManager(threading.Thread):
     """Thread that owns a single TestRunner process and any processes required
     by the TestRunner (e.g. the Firefox binary)"""
 
-    def __init__(self, server_url, firefox_binary, tests_queue, results_queue,
+    def __init__(self, server_url, firefox_binary, run_info, tests_queue,
                  stop_flag, runner_cls=TestharnessTestRunner,
                  marionette_port=None, process_cls=FirefoxProcess):
         self.http_server_url = server_url
         self.firefox_binary = firefox_binary
         self.tests_queue = tests_queue
-        self.results_queue = results_queue
+        self.run_info = run_info
         self.stop_flag = stop_flag
         self.command_pipe = None
         self.firefox_runner = None
@@ -425,39 +529,35 @@ class TestRunnerManager(threading.Thread):
         except Empty:
             self.send_message("stop")
         else:
-            self.logger.testStart({"test":test}, buffer=True)
+            self.logger.test_start(test.id)
             self.send_message("run_test", test)
 
     def test_ended(self, test, results):
         #It would be nice to move this down into the runner
-        for result in results["tests"]:
-            status = get_test_status(test, result["name"], result["status"])
+        file_result, test_results = results
+        for result in test_results:
+            if test.disabled_subtest(result.name, self.run_info):
+                continue
+            expected = test.expected_subtest(result.name, self.run_info) == result.status
+            self.logger.test_result(test.id,
+                                    result.name,
+                                    result.status,
+                                    message=result.message,
+                                    unexpected=not expected)
 
-            log_func = self.logger.testPass if status == "PASS" else self.logger.testFail
-            log_func({"test":test,
-                      "subtest":result["name"],
-                      "status":status}, buffer=True)
-        self.results_queue.put((test, results))
-
-        harness_status = get_harness_status(test, results["status"])
-        #This just uses the harness status, not the status of any subtests
-        log_func = {"OK": self.logger.testPass,
-                    "ERROR": self.logger.testFail,
-                    "TIMEOUT": self.logger.testFail,
-                    "CRASH": self.logger.processCrash}[harness_status]
-        log_func({"test": test,
-                  "status": harness_status})
-        self.logger.testEnd({"test": test}, buffer=True)
-        self.logger.flush()
-        if results["status"] == "CRASH":
+        expected = test.expected_file(self.run_info) == file_result.status
+        self.logger.test_end(test.id,
+                             file_result.status,
+                             message=file_result.message,
+                             unexpected=not expected)
+        if file_result.status == "CRASH":
             self.restart_runner()
         self.start_next_test()
 
     def timeout(self, test):
-        self.results_queue.put((test, {"status":"TIMEOUT", "tests":[]}))
-        self.logger.testEnd({"test":test,
-                             "status":"TIMEOUT"}, buffer=True)
-        self.logger.flush()
+        self.logger.test_end(test.id,
+                             "TIMEOUT",
+                             unexpected=test.expected_file(self.run_info) == "TIMEOUT")
         self.restart_runner()
 
     def restart_runner(self):
@@ -467,8 +567,9 @@ class TestRunnerManager(threading.Thread):
     def on_output(self, line):
         self.logger.info({"subaction":"firefox-output", "msg":line})
 
+
 class ManagerPool(object):
-    def __init__(self, runner_cls, size, server_url, binary_path,
+    def __init__(self, runner_cls, run_info, size, server_url, binary_path,
                  process_cls=FirefoxProcess):
         self.server_url = server_url
         self.binary_path = binary_path
@@ -479,26 +580,26 @@ class ManagerPool(object):
         #Event that is polled by threads so that they can gracefully exit in the face
         #of sigint
         self.stop_flag = threading.Event()
+        self.run_info = run_info
         signal.signal(signal.SIGINT, get_signal_handler(self))
 
     def start(self, tests_queue):
-        results_queue = Queue()
         used_ports = set()
         logger.debug("Using %i processes" % self.size)
         for i in range(self.size):
             marionette_port = get_free_port(2828, exclude=used_ports)
             used_ports.add(marionette_port)
             manager = TestRunnerManager(self.server_url,
-                                        self.binary_path, 
+                                        self.binary_path,
+                                        self.run_info,
                                         tests_queue,
-                                        results_queue,
                                         self.stop_flag,
                                         runner_cls=self.runner_cls,
                                         marionette_port=marionette_port,
                                         process_cls=self.process_cls)
             manager.start()
             self.pool.add(manager)
-        return results_queue
+        return
 
     def is_alive(self):
         for manager in self.pool:
@@ -506,43 +607,48 @@ class ManagerPool(object):
                 return True
         return False
 
+    def wait(self):
+        for item in self.pool:
+            item.join()
+
     def stop(self):
         self.stop_flag.set()
-        
 
-def queue_tests(test_root, test_path, test_types):
+
+def load_manifest(test_root):
     sys.path.insert(0, os.path.join(test_root, "tools", "scripts"))
-    import update_manifest
+    import manifest
 
+    mainfest_path = os.path.abspath(os.path.join(os.path.split(__file__)[0],
+                                                 "metadata", "MANIFEST.json"))
+
+    manifest.setup_git(test_root)
+    test_manifest = manifest.load(mainfest_path)
+    manifest.update(test_manifest)
+    return test_manifest
+
+def load_expected(test):
+    expected_root = os.path.join(os.path.split(__file__)[0], "metadata")
+    expected_path = os.path.join(expected_root, test.path + ".ini")
+    if not os.path.exists(expected_path):
+        expected_data = {}
+    else:
+        expected_data = expected.parse(expected_root, expected_path)
+    return expected_data
+
+
+def queue_tests(test_root, test_types, run_info):
     tests_by_type = defaultdict(Queue)
 
-    if os.path.split(test_path)[1] == "MANIFEST":
-        manifest = update_manifest.Manifest.from_file(test_path)
-        tests_by_type = tests_from_manifest(manifest, test_types)
-    else:
-        for dirpath, dirnames, filenames in os.walk(test_path):
-            if "MANIFEST" not in filenames:
-                continue
-            manifest = update_manifest.Manifest.from_file(test_root, 
-                                                          os.path.join(dirpath, "MANIFEST"))
-            manifest_tests = tests_from_manifest(manifest, test_types)
-            for test_type, tests in manifest_tests.iteritems():
-                for test in tests:
-                    tests_by_type[test_type].put(test)
+    test_manifest = load_manifest(test_root)
 
-    return tests_by_type
-
-def tests_from_manifest(manifest, test_types):
-    tests_by_type = defaultdict(list)
     for test_type in test_types:
-        for test in manifest.iter_type(test_type):
-            test_url = "%s/%s" % (manifest.server_path, test["url"])
-            if test_type == "reftest":
-                ref_url = "%s/%s" % (manifest.server_path, test["ref_url"])
-                test = (test_url, test["ref_type"], ref_url)
-            else:
-                test = (test_url,)
-            tests_by_type[test_type].append(test)
+        for test in test_manifest.itertype(test_type):
+            expected = load_expected(test)
+            test = construct_test(test, expected)
+            if not test.disabled(run_info):
+                tests_by_type[test_type].put(test)
+
     return tests_by_type
 
 
@@ -570,6 +676,8 @@ def parse_args():
                         help="Number of simultaneous processes to use")
     parser.add_argument("--xvfb", action="store_true",
                         help="Run processes that require the display under xvfb")
+    parser.add_argument("--stream", action="store", type=int, default=1234,
+                        help="Stream the log messages to a port")
     rv = parser.parse_args()
     if rv.test is None:
         rv.test = rv.tests_root
@@ -588,16 +696,20 @@ test_runner_classes = {"reftest": ReftestTestRunner,
 def main():
     t0 = time.time()
     args = parse_args()
-    
+
+    # if args.stream:
+    #     socket_handler = structuredlog.SocketHandler("127.0.0.1", args.stream)
+    #     logger.handlers.append(socket_handler)
+
+    pr = cProfile.Profile()
+    pr.enable()
+
+    run_info = RunInfo(False)
 
     server_manager = start_http_server(args.server, args.tests_root)
-
-    test_queues = queue_tests(args.tests_root, args.test, args.test_types)
-
-    
-    logger.debug("Running %i test files" % reduce(lambda x, y: x + y.qsize(), test_queues.itervalues(), 0))
-    with open("results.json", "w") as f:
-        f.write("[\n")
+    try:
+        test_queues = queue_tests(args.tests_root, args.test_types, run_info)
+        logger.tests_start(reduce(lambda x, y: x + y.qsize(), test_queues.itervalues(), 0))
         for test_type in args.test_types:
             tests_queue = test_queues[test_type]
             runner_cls = test_runner_classes[test_type]
@@ -606,23 +718,23 @@ def main():
             if args.xvfb:
                 process_cls = XvfbWrapped(process_cls)
 
-            try:
-                pool = ManagerPool(runner_cls, args.processes, server_manager.proc.url,
-                                   args.binary, process_cls=process_cls)
-                results_queue = pool.start(tests_queue)
-                while True:
-                    try:
-                        result = results_queue.get(True, 1)
-                    except Empty:
-                        if not pool.is_alive():
-                            break
-                    else:
-                        f.write(json.dumps(result) + ",\n")
-            finally:
-                server_manager.stop()
-        f.write("]")
-    
-        logger.info({"msg":"Harness finsihed", "duration":(time.time() - t0)})
+
+            pool = ManagerPool(runner_cls,
+                               run_info,
+                               args.processes,
+                               server_manager.proc.url,
+                               args.binary,
+                               process_cls=process_cls)
+            pool.start(tests_queue)
+            pool.wait()
+        logger.tests_end()
+    finally:
+        server_manager.stop()
+        pr.disable()
+        pr.dump_stats("profile.stats")
+        stats = pstats.Stats("profile.stats")
+        stats.sort_stats("cumtime")
+        stats.print_callers(5)
 
 if __name__ == "__main__":
     main()

@@ -1,14 +1,16 @@
+import sys
 from collections import deque
 from threading import current_thread, RLock
 import time
-
-import mozlog
+import socket
+import json
 
 loggers = {}
 
 #An alternate proposal for logging:
 #Allowed actions, and subfields:
 #  TESTS-START
+#      number
 #  TESTS-END
 #  TEST-START
 #      test
@@ -19,7 +21,7 @@ loggers = {}
 #  TEST-RESULT
 #      test
 #      subtest
-#      status [PASS | FAIL | TIMEOUT | NOTRUN ]
+#      status [PASS | FAIL | TIMEOUT | NOTRUN]
 #      unexpected [True | not given]
 #  OUTPUT
 #      line
@@ -27,55 +29,133 @@ loggers = {}
 #      level
 #      message
 
-def getLogger(name, handler=None):
+def getLogger(name, handlers=None):
     if name not in loggers:
-        loggers[name] = mozlog.getLogger(name, handler)
-    return StructuredLogger(loggers[name])
+        loggers[name] = MozLogger(name, handlers)
+    return loggers[name]
 
-class StructuredLogger(object):
+
+class MozLogger(object):
     _lock = RLock()
 
-    def __init__(self, logger):
-        self._logger = logger 
+    _log_levels = dict((k.upper(),v) for v,k in 
+                       enumerate(["critical", "error", "warning", "info", "debug"]))
+
+    def __init__(self, name, handlers=None):
+        self.name = name
         self._log_queue = deque([])
-        self.buffer_default = False
 
-    def __getattr__(self, name):
-        return getattr(self._logger, name)
+        if handlers is None:
+            handlers = set(StreamHandler())
+        if not hasattr(handlers, "__iter__"):
+            handlers = set(handlers)
+        self.handlers = handlers
 
-    def log(self, level, params):
+        self._level = self._log_levels["DEBUG"]
+
+    def _log_data(self, action, data=None):
+        if data is None:
+            data = {}
         with self._lock:
-            self._logger.log_structured(level, params)
+            log_data = self._make_log_data(action, data)
+            for handler in self.handlers:
+                handler(log_data)
 
-    def log_defer(self, level, params):
-        self._log_queue.append((level, params))
+    def _make_log_data(self, action, data):
+        all_data = {"action":action,
+                    "time":int(time.time() * 1000),
+                    "thread":current_thread().name,
+                    "source":self.name}
+        all_data.update(data)
+        return all_data
+
+    def _queue_data(self, action, data=None):
+        if data is None:
+            data = {}
+        self._log_queue.append(self._make_log_data(action, data))
+
+    def tests_start(self, number):
+        self._log_data("TESTS-START", {"number":number})
+
+    def tests_end(self):
+        self._log_data("TESTS-END")
+
+    def test_start(self, test):
+        self._queue_data("TEST-START", {"test":test})
+
+    def test_result(self, test, subtest, status, message=None, unexpected=False):
+        if status.upper() not in ["PASS", "FAIL", "TIMEOUT", "NOTRUN", "ASSERT"]:
+            raise ValueError, "Unrecognised status %s" % statsu
+        data = {"test":test,
+                "subtest":subtest,
+                "status": status.upper()}
+        if message is not None:
+            data["message"] = message
+        self._queue_data("TEST-RESULT", data)
+
+    def test_end(self, test, status, message=None, unexpected=False):
+        if status.upper() not in ["OK", "ERROR", "TIMEOUT", "CRASH", "ASSERT"]:
+            raise ValueError, "Unrecognised status %s" % statsu
+        data = {"test":test,
+                "status": status.upper()}
+        if message is not None:
+            data["message"] = message
+        self._queue_data("TEST-END", data)
+        self.flush()
+
+    def process_output(self, process, data):
+        self._queue_data("PROCESS-OUTPUT", {"process":process,
+                                            "data": data})
 
     def flush(self):
         with self._lock:
             while self._log_queue:
-                self._logger.log_structured(*self._log_queue.popleft())
+                entry = self._log_queue.popleft()
+                for handler in self.handlers:
+                    handler(entry)
 
-def _test_log_func(level_name):
-    def log(self, params, buffer=None):
-        if not hasattr(params, "iteritems"):
-            params = {"msg":params}
-
-        all_params = {"_thread":current_thread().name,
-                      "time":time.time()}
-        all_params.update(params)
-        buffer = buffer if buffer is not None else self.buffer_default
-        if buffer:
-            self.log_defer(level_name, all_params)
-        else:
-            self.log(level_name, all_params)
+def _log_func(level_name):
+    def log(self, message):
+        level = self._log_levels[level_name]
+        if level < self._level:
+            self._log_data(level_name, {"message": message})
     return log
 
-for name in ["critical", "error", "warning", "info", "debug",
-             "test-start", "test-end", "test-pass", "test-fail",
-             "test-known-fail", "process-crash"]:
-    parts = name.split("-")
-    action = "-".join(item.upper() for item in parts)
-    for i, part in enumerate(parts[1:]):
-        parts[i+1] = part.title()
-    func_name = "".join(parts)
-    setattr(StructuredLogger, func_name, _test_log_func(action))
+for level_name in MozLogger._log_levels:
+    setattr(MozLogger, level_name.lower(), _log_func(level_name))
+
+class JSONFormatter(object):
+    def __call__(self, data):
+        return json.dumps(data)
+
+class StreamHandler(object):
+    def __init__(self,  stream=sys.stderr, formatter=JSONFormatter()):
+        self.stream = stream
+        self.formatter = formatter
+
+    def __call__(self, data):
+        self.stream.write(self.formatter(data) + "\n")
+        #self.stream.flush()
+
+#Tshere is lots more fanciness in the logging equivalent of this
+class SocketHandler(object):
+    def __init__(self, host, port, formatter=JSONFormatter()):
+        self.host = host
+        self.port = port
+        self.socket = None
+
+    def __call__(self, data):
+        if not self.socket:
+            self.socket = self.create_socket()
+        
+        self.socket.write(self.formatter(data) + "\n")
+        self.socket.flush()
+
+    def create_socket(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect((self.host, self.port))
+        return sock
+
+    def close(self):
+        if self.socket:
+            self.socket.close()

@@ -5,7 +5,8 @@ addEventListener("message", function(e) {
     var test_results = e.data.tests.map(function(x) {
         return {name:x.name, status:x.status, message:x.message}
     });
-    marionetteScriptFinished({tests:test_results, status: e.data.status.status});
+    marionetteScriptFinished({tests:test_results, status: e.data.status.status,
+                              message: e.data.status.message});
   }
 }, false);
 win.location = "%s";
