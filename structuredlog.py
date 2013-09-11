@@ -1,11 +1,10 @@
 import sys
-from collections import deque
+from collections import deque, defaultdict
 from threading import current_thread, RLock
 import time
 import socket
 import json
-
-loggers = {}
+import weakref
 
 #An alternate proposal for logging:
 #Allowed actions, and subfields:
@@ -29,29 +28,56 @@ loggers = {}
 #      level
 #      message
 
-def getLogger(name, handlers=None):
-    if name not in loggers:
-        loggers[name] = MozLogger(name, handlers)
-    return loggers[name]
+_loggers = defaultdict(dict)
 
+#Semantics are a bit weird
+#Because the buffers are per-thread you need a different TestOutput instance on each thread
+#However there is exactly one instance per thread and the handlers are shared cross-thread
+#Multiple processes are not supported
+#This should be made more sane
 
-class MozLogger(object):
+def getOutputLogger(name):
+    thread_name = current_thread().name
+    if not name in _loggers or thread_name not in _loggers[name] or _loggers[name][thread_name] is None:
+        output_logger = TestOutput(name)
+        _loggers[name][thread_name] = weakref.ref(output_logger)
+    rv = _loggers[name][thread_name]()
+    return rv
+
+class LoggedRLock(object):
+    def __init__(self, name):
+        self.name = name
+        self._lock = RLock()
+
+    def __enter__(self):
+        sys.stderr.write("Lock %s requested by %s\n" % (self.name, current_thread().name))
+        self._lock.acquire()
+        sys.stderr.write("Lock %s acquired by %s\n" % (self.name, current_thread().name))
+        sys.stderr.flush()
+
+    def __exit__(self, *args):
+        sys.stderr.write("Lock %s being released by %s\n" % (self.name, current_thread().name))
+        sys.stderr.flush()
+        self._lock.release()
+
+class TestOutput(object):
     _lock = RLock()
-
-    _log_levels = dict((k.upper(),v) for v,k in 
+    _log_levels = dict((k.upper(),v) for v,k in
                        enumerate(["critical", "error", "warning", "info", "debug"]))
+    _handlers = defaultdict(list)
 
     def __init__(self, name, handlers=None):
         self.name = name
         self._log_queue = deque([])
 
-        if handlers is None:
-            handlers = set(StreamHandler())
-        if not hasattr(handlers, "__iter__"):
-            handlers = set(handlers)
-        self.handlers = handlers
-
         self._level = self._log_levels["DEBUG"]
+
+    def add_handler(self, handler):
+        self._handlers[self.name].append(handler)
+
+    @property
+    def handlers(self):
+        return self._handlers[self.name]
 
     def _log_data(self, action, data=None):
         if data is None:
@@ -65,14 +91,15 @@ class MozLogger(object):
         all_data = {"action":action,
                     "time":int(time.time() * 1000),
                     "thread":current_thread().name,
-                    "source":self.name}
+                    "source":"%s (%d)" % (self.name, id(self))}
         all_data.update(data)
         return all_data
 
     def _queue_data(self, action, data=None):
-        if data is None:
-            data = {}
-        self._log_queue.append(self._make_log_data(action, data))
+        with self._lock:
+            if data is None:
+                data = {}
+            self._log_queue.append(self._make_log_data(action, data))
 
     def tests_start(self, number):
         self._log_data("TESTS-START", {"number":number})
@@ -115,27 +142,35 @@ class MozLogger(object):
                     handler(entry)
 
 def _log_func(level_name):
-    def log(self, message):
+    def log(self, message, params=None):
         level = self._log_levels[level_name]
-        if level < self._level:
-            self._log_data(level_name, {"message": message})
+        if level <= self._level:
+            if params is None:
+                params = {}
+            data = {"message": message}
+            data.update(params)
+            self._log_data(level_name, data)
     return log
 
-for level_name in MozLogger._log_levels:
-    setattr(MozLogger, level_name.lower(), _log_func(level_name))
+for level_name in TestOutput._log_levels:
+    setattr(TestOutput, level_name.lower(), _log_func(level_name))
 
 class JSONFormatter(object):
     def __call__(self, data):
         return json.dumps(data)
 
+
 class StreamHandler(object):
+    _lock = RLock()
     def __init__(self,  stream=sys.stderr, formatter=JSONFormatter()):
         self.stream = stream
         self.formatter = formatter
 
     def __call__(self, data):
-        self.stream.write(self.formatter(data) + "\n")
-        #self.stream.flush()
+        formatted = self.formatter(data)
+        with self._lock:
+            self.stream.write(formatted + "\n")
+            self.stream.flush()
 
 #Tshere is lots more fanciness in the logging equivalent of this
 class SocketHandler(object):
