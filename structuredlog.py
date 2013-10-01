@@ -155,9 +155,8 @@ def _log_func(level_name):
 for level_name in TestOutput._log_levels:
     setattr(TestOutput, level_name.lower(), _log_func(level_name))
 
-class JSONFormatter(object):
-    def __call__(self, data):
-        return json.dumps(data)
+
+JSONFormatter = lambda:json.dumps
 
 
 class StreamHandler(object):
@@ -172,7 +171,7 @@ class StreamHandler(object):
             self.stream.write(formatted + "\n")
             self.stream.flush()
 
-#Tshere is lots more fanciness in the logging equivalent of this
+#There is lots more fanciness in the logging equivalent of this
 class SocketHandler(object):
     def __init__(self, host, port, formatter=JSONFormatter()):
         self.host = host

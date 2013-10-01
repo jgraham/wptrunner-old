@@ -1,5 +1,8 @@
+window.wrappedJSObject.timeout_multiplier = 1;
+
 function listener(e) {
     if(e.data.type == "complete") {
+        clearTimeout(timer);
         removeEventListener("message", listener); 
         var test_results = e.data.tests.map(function(x) {
             return {name:x.name, status:x.status, message:x.message}
@@ -11,5 +14,8 @@ function listener(e) {
     }
 }
 addEventListener("message", listener, false);
-window.open("%(abs_url)s", "%(window_id)s");
+window.wrappedJSObject.win = window.open("%(abs_url)s", "%(window_id)s");
 
+var timer = setTimeout(function() {
+    window.wrappedJSObject.win.timeout();
+}, %(timeout)s);

@@ -27,7 +27,8 @@ import mozinfo
 import structuredlog
 import expected
 
-DEFAULT_TIMEOUT = 20 #seconds
+DEFAULT_TIMEOUT = 10 #seconds
+LONG_TIMEOUT = 60 #seconds
 
 #TODO
 # reftest details (window size+ lots more)
@@ -41,7 +42,14 @@ DEFAULT_TIMEOUT = 20 #seconds
 
 logger = structuredlog.getOutputLogger("WPT")
 
+def do_test_relative_imports(test_root):
+    global serve
+    global manifest
 
+    sys.path.insert(0, os.path.join(test_root))
+    sys.path.insert(0, os.path.join(test_root, "tools", "scripts"))
+    import serve
+    import manifest
 
 def make_wrapper(cmd, cmd_args):
     class WrappedCommand(type):
@@ -58,80 +66,34 @@ def make_wrapper(cmd, cmd_args):
 
 XvfbWrapped = make_wrapper("xvfb-run", ["-a", "--server-args=+extension RANDR -screen 0 800x600x24"])
 
-
-class HttpServer(mozprocess.ProcessHandlerMixin):
-    def __init__(self, path, test_root, host="127.0.0.1", port=8000,
-                 **kwargs):
-        """HTTP Server process.
-
-        :param path: Path to the server binary
-        :param test_root: Path to the root of the tests
-        :param host: Hostname to run the server on
-        :param port: Port to run the server on"""
-        self.path = path
-        self.test_root = test_root
-        self.host = host
-        self.port = port
-
-        mozprocess.ProcessHandlerMixin.__init__(self, path, self.get_args(),
-                                                **kwargs)
-
-    def get_args(self):
-        return [self.test_root,
-                "--port=%i" % self.port,
-                "--host=%s" % self.host]
-
-    @property
-    def url(self):
-        return "http://%s:%i/" % (self.host, self.port)
-
-class HttpServerManager(object):
+class TestEnvironmentManager(object):
     #Could perhaps just fold this in to the HttpServer class
-    def __init__(self, binary_path, test_path, host="127.0.0.1", port=8000):
-        self.host = host
-        self.port = port
-        self.proc = HttpServer(binary_path, test_path, host, port,
-                               stderr=sys.stderr)
-        self.timeout = 10
+    def __init__(self, test_path):
+        self.test_path = test_path
+        self.config_path = os.path.join(self.test_path, "config.json")
+        self.server = None
+        self.config = None
 
     def start(self):
-        self.proc.run()
-
-    def ping(self):
-        #Might be easier just to see if it is possible to connect with a socket
-        try:
-            urllib2.urlopen("http://%s:%i" % (self.host, self.port), timeout=self.timeout)
-        except socket.timeout:
-            return False
-        except urllib2.HTTPError:
-            return True
-        except urllib2.URLError:
-            return False
-        return True
+        with open(self.config_path) as f:
+            config = json.load(f)
+        self.config, self.servers = serve.start(config)
+        print self.servers
 
     def stop(self):
-        self.proc.kill()
+        for scheme, servers in self.servers.iteritems():
+            for port, server in servers:
+                server.stop()
 
     def restart(self):
         self.stop()
         self.start()
 
 
-def start_http_server(http_server_path, test_path):
-    server_manager = HttpServerManager(http_server_path, test_path)
-    server_manager.start()
-    server_started = False
-    for i in xrange(10):
-        server_started = server_manager.ping()
-        if server_started:
-            break
-        time.sleep(1)
-
-    if not server_started:
-        sys.stderr.write("Failed to start HTTP server")
-        server_manager.stop()
-        sys.exit(1)
-    return server_manager
+def setup_environment(test_path):
+    manager = TestEnvironmentManager(test_path)
+    manager.start()
+    return manager
 
 
 def get_free_port(start_port, exclude=None):
@@ -209,19 +171,22 @@ class ReftestTest(Test):
 def construct_test(manifest_test, expectations):
     test_cls = {"reftest":ReftestTest,
                 "testharness":TestharnessTest}[manifest_test.item_type]
+
+    timeout = LONG_TIMEOUT if manifest_test.timeout == "long" else DEFAULT_TIMEOUT
+
     if test_cls == ReftestTest:
         return test_cls(manifest_test.url,
                         manifest_test.ref_url,
                         manifest_test.ref_type,
                         expectations,
-                        timeout=manifest_test.timeout)
+                        timeout=timeout)
     else:
         return test_cls(manifest_test.url,
                         expectations,
-                        timeout=manifest_test.timeout)
+                        timeout=timeout)
 
 class HarnessResult(object):
-    statuses = set(["OK", "ERROR", "TIMEOUT", "CRASH"])
+    statuses = set(["OK", "ERROR", "TIMEOUT", "EXTERNAL-TIMEOUT", "CRASH"])
 
     def __init__(self, status, message):
         if status not in self.statuses:
@@ -251,10 +216,10 @@ class TestRunner(object):
         self.marionette_port = marionette_port
         self.timer = None
         self.window_id = str(uuid.uuid4())
+        self.timeout_multiplier = 1 #TODO: Adjust this depending on tests and hardware
 
     def setup(self):
         logger.debug("Connecting to marionette on port %i" % self.marionette_port)
-        #Supporting multiple processes requires a choice of ports here
         self.browser = marionette.Marionette(host='localhost', port=self.marionette_port)
         #XXX Move this timeout somewhere
         success = self.browser.wait_for_port(20)
@@ -300,15 +265,13 @@ class TestRunner(object):
             with result_lock:
                 if not result_flag.is_set():
                     result_flag.set()
-                    result = (HarnessResult("TIMEOUT", None), [])
+                    result = (HarnessResult("EXTERNAL-TIMEOUT", None), [])
                     self.send_message("test_ended", test, result)
 
-        timeout = test.timeout if test.timeout else DEFAULT_TIMEOUT
-
-        self.timer = threading.Timer(timeout + 10, timeout_func)
+        self.timer = threading.Timer(test.timeout + 10, timeout_func)
         self.timer.start()
 
-        self.browser.set_script_timeout(timeout * 1000)
+        self.browser.set_script_timeout((test.timeout + 5) * 1000)
 
         try:
             result = self.convert_result(test, self.do_test(test))
@@ -316,7 +279,7 @@ class TestRunner(object):
             with result_lock:
                 if not result_flag.is_set():
                     result_flag.set()
-                    result = (HarnessResult("TIMEOUT", None), [])
+                    result = (HarnessResult("EXTERNAL-TIMEOUT", None), [])
             #Clean up any unclosed windows
             #This doesn't account for the possibility the browser window
             #is totally hung. That seems less likely since we are still
@@ -377,18 +340,23 @@ class TestharnessTestRunner(TestRunner):
 
     def setup(self):
         if TestRunner.setup(self):
-            self.browser.navigate("data:text/html," + urllib.quote(open("testharness.html").read() % {"window_id": self.window_id, "title": threading.current_thread().name}))
+            self.browser.navigate(urlparse.urljoin(self.http_server_url, "/gecko_runner.html"))
+            self.browser.execute_script("document.title = '%s'" % threading.current_thread().name)
+
 
     def do_test(self, test):
         return self.browser.execute_async_script(
             self.script % {"abs_url": urlparse.urljoin(self.http_server_url, test.url),
                            "url": test.url,
-                           "window_id": self.window_id}, new_sandbox=False)
+                           "window_id": self.window_id,
+                           "timeout_multiplier": self.timeout_multiplier,
+                           "timeout": test.timeout * 1000}, new_sandbox=False)
 
     def convert_result(self, test, result):
         """Convert a JSON result into a (HarnessResult, [TestResult]) tuple"""
         assert result["test"] == test.url, "Got results from %s, expected %s" % (result["test"], test.url)
-        return (HarnessResult(self.harness_codes[result["status"]], result["message"]),
+        harness_result = HarnessResult(self.harness_codes[result["status"]], result["message"])
+        return (harness_result,
                 [TestResult(test["name"], self.test_codes[test["status"]],
                             test["message"]) for test in result["tests"]])
 
@@ -594,13 +562,13 @@ class TestRunnerManager(threading.Thread):
 
         expected = test.expected_file(self.run_info) == file_result.status
         self.logger.test_end(test.id,
-                             file_result.status,
+                             file_result.status if file_result.status != "EXTERNAL-TIMEOUT" else "TIMEOUT",
                              message=file_result.message,
                              unexpected=not expected)
         #Restarting after a timeout is quite wasteful, but it seems otherwise we can get
         #results from the timed-out test back when we are waiting for the results of a
         #later test
-        if file_result.status in ("TIMEOUT", "CRASH"):
+        if file_result.status in ("CRASH", "EXTERNAL-TIMEOUT"):
             self.restart_runner()
         else:
             self.start_next_test()
@@ -612,6 +580,7 @@ class TestRunnerManager(threading.Thread):
 
     def setup_failed(self):
         self.init_timer.cancel()
+        self.send_message("stop")
         self.setup_fail_count += 1
         if self.setup_fail_count < self.max_setup_fails:
             self.restart_runner()
@@ -673,9 +642,6 @@ class ManagerPool(object):
 
 
 def load_manifest(test_root):
-    sys.path.insert(0, os.path.join(test_root, "tools", "scripts"))
-    import manifest
-
     mainfest_path = os.path.abspath(os.path.join(os.path.split(__file__)[0],
                                                  "metadata", "MANIFEST.json"))
 
@@ -727,10 +693,7 @@ def parse_args():
                         type=abs_path,
                         help="Binary to run tests against")
     parser.add_argument("tests_root", action="store", type=abs_path,
-                        help="Path to web-platform-tests")
-    parser.add_argument("--server", action="store", type=abs_path,
-                        default=os.path.join(".", "wptserve", "wptserve.py"),
-                        help="Path to web-platform-tests server")
+                        help="Path to web-platform-tests"),
     parser.add_argument("--test-types", action="store",
                         nargs="*", default=["testharness"],
                         choices=test_runner_classes.keys(),
@@ -770,6 +733,8 @@ def main():
         f = sys.stderr
     logger.add_handler(structuredlog.StreamHandler(f))
 
+    do_test_relative_imports(args.tests_root)
+
     # if args.stream:
     #     socket_handler = structuredlog.SocketHandler("127.0.0.1", args.stream)
     #     logger.handlers.append(socket_handler)
@@ -779,7 +744,9 @@ def main():
 
     run_info = RunInfo(False)
 
-    server_manager = start_http_server(args.server, args.tests_root)
+    test_environment = setup_environment(args.tests_root)
+    base_server = "http://%s:%i" % (test_environment.config["host"],
+                                    test_environment.config["ports"]["http"][0])
     try:
         test_queues = queue_tests(args.tests_root, args.test_types, run_info,
                                   args.include)
@@ -796,14 +763,14 @@ def main():
             pool = ManagerPool(runner_cls,
                                run_info,
                                args.processes,
-                               server_manager.proc.url,
+                               base_server,
                                args.binary,
                                process_cls=process_cls)
             pool.start(tests_queue)
             pool.wait()
         logger.tests_end()
     finally:
-        server_manager.stop()
+        test_environment.stop()
         pr.disable()
         pr.dump_stats("profile.stats")
         stats = pstats.Stats("profile.stats")
