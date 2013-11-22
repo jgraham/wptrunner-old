@@ -8,23 +8,25 @@ import weakref
 
 #An alternate proposal for logging:
 #Allowed actions, and subfields:
-#  TESTS-START
-#      number
-#  TESTS-END
-#  TEST-START
+#  suite_start
+#      tests
+#  suite_end
+#  test_start
 #      test
-#  TEST-END
+#  test_end
 #      test
 #      status [OK | ERROR | TIMEOUT | CRASH | ASSERT?]
 #      unexpected [True | not given]
-#  TEST-RESULT
+#  test_result
 #      test
 #      subtest
 #      status [PASS | FAIL | TIMEOUT | NOTRUN]
 #      unexpected [True | not given]
-#  OUTPUT
-#      line
-#  LOG
+#  process_output
+#      process
+#      command
+#      data
+#  log
 #      level
 #      message
 
@@ -101,16 +103,16 @@ class TestOutput(object):
                 data = {}
             self._log_queue.append(self._make_log_data(action, data))
 
-    def tests_start(self, number):
-        self._log_data("TESTS-START", {"number":number})
+    def suite_start(self, tests):
+        self._log_data("suite_start", {"tests":tests})
 
-    def tests_end(self):
-        self._log_data("TESTS-END")
+    def suite_end(self):
+        self._log_data("suite_end")
 
     def test_start(self, test):
-        self._queue_data("TEST-START", {"test":test})
+        self._queue_data("test_start", {"test":test})
 
-    def test_result(self, test, subtest, status, message=None, unexpected=False):
+    def test_status(self, test, subtest, status, message=None, unexpected=False):
         if status.upper() not in ["PASS", "FAIL", "TIMEOUT", "NOTRUN", "ASSERT"]:
             raise ValueError, "Unrecognised status %s" % statsu
         data = {"test":test,
@@ -118,7 +120,9 @@ class TestOutput(object):
                 "status": status.upper()}
         if message is not None:
             data["message"] = message
-        self._queue_data("TEST-RESULT", data)
+        if unexpected:
+            data["unexpected"] = True
+        self._queue_data("test_status", data)
 
     def test_end(self, test, status, message=None, unexpected=False):
         if status.upper() not in ["OK", "ERROR", "TIMEOUT", "CRASH", "ASSERT"]:
@@ -127,12 +131,16 @@ class TestOutput(object):
                 "status": status.upper()}
         if message is not None:
             data["message"] = message
-        self._queue_data("TEST-END", data)
+        if unexpected:
+            data["unexpected"] = True
+        self._queue_data("test_end", data)
         self.flush()
 
-    def process_output(self, process, data):
-        self._queue_data("PROCESS-OUTPUT", {"process":process,
-                                            "data": data})
+    def process_output(self, process, data, command=None):
+        data = {"process":process, "data": data}
+        if command is not None:
+            data["command"] = command
+        self._queue_data("process_output", data)
 
     def flush(self):
         with self._lock:
@@ -147,17 +155,15 @@ def _log_func(level_name):
         if level <= self._level:
             if params is None:
                 params = {}
-            data = {"message": message}
+            data = {"level": level_name, "message": message}
             data.update(params)
-            self._log_data(level_name, data)
+            self._log_data("log", data)
     return log
 
 for level_name in TestOutput._log_levels:
     setattr(TestOutput, level_name.lower(), _log_func(level_name))
 
-
 JSONFormatter = lambda:json.dumps
-
 
 class StreamHandler(object):
     _lock = RLock()
@@ -181,7 +187,7 @@ class SocketHandler(object):
     def __call__(self, data):
         if not self.socket:
             self.socket = self.create_socket()
-        
+
         self.socket.write(self.formatter(data) + "\n")
         self.socket.flush()
 
@@ -193,3 +199,44 @@ class SocketHandler(object):
     def close(self):
         if self.socket:
             self.socket.close()
+
+
+def get_adapter_cls():
+    #Hide this in a function so that we don't import logging unless
+    #it is really needed
+    import logging
+
+    class LoggingAdapter(logging.Handler):
+        def __init__(self, name=None, level=logging.NOTSET):
+            self.structured = TestOutput(name)
+            logging.Handler.__init__(self, level=level)
+
+        def emit(self, record):
+            if record.levelname in self.structured._log_levels:
+                log_func = getattr(self.structured, record.levelname.lower())
+            else:
+                log_func = self.logger.debug
+            log_func(record.msg)
+
+        def handle(self, record):
+            self.emit(record)
+
+    return LoggingAdapter
+
+
+def action_filter(log_iter, actions):
+    for item in log_iter:
+        if item["action"] in actions:
+            yield item
+
+def map_action(log_iter, action_map):
+    for item in log_iter:
+        if item["action"] in action_map:
+            yield action_map[item["action"]](item)
+
+def read_logs(log_f):
+    for line in log_f:
+        try:
+            yield json.loads(line)
+        except ValueError:
+            print line

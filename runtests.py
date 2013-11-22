@@ -14,21 +14,17 @@ import socket
 import signal
 import hashlib
 from collections import defaultdict, deque
-import pstats
-import cProfile
 import uuid
+import logging
 
 import marionette
 import mozprocess
 from mozprofile.profile import Profile
 from mozrunner import FirefoxRunner
-import mozinfo
 
 import structuredlog
-import expected
-
-DEFAULT_TIMEOUT = 10 #seconds
-LONG_TIMEOUT = 60 #seconds
+import metadata
+import test as test_
 
 #TODO
 # reftest details (window size+ lots more)
@@ -42,14 +38,17 @@ LONG_TIMEOUT = 60 #seconds
 
 logger = structuredlog.getOutputLogger("WPT")
 
+def setup_stdlib_logger():
+    logging.root.handlers = []
+    adapter_cls = structuredlog.get_adapter_cls()
+    logging.root.addHandler(adapter_cls())
+
 def do_test_relative_imports(test_root):
     global serve
-    global manifest
 
     sys.path.insert(0, os.path.join(test_root))
     sys.path.insert(0, os.path.join(test_root, "tools", "scripts"))
     import serve
-    import manifest
 
 def make_wrapper(cmd, cmd_args):
     class WrappedCommand(type):
@@ -66,34 +65,24 @@ def make_wrapper(cmd, cmd_args):
 
 XvfbWrapped = make_wrapper("xvfb-run", ["-a", "--server-args=+extension RANDR -screen 0 800x600x24"])
 
-class TestEnvironmentManager(object):
-    #Could perhaps just fold this in to the HttpServer class
+class TestEnvironment(object):
     def __init__(self, test_path):
         self.test_path = test_path
         self.config_path = os.path.join(self.test_path, "config.json")
         self.server = None
         self.config = None
 
-    def start(self):
+    def __enter__(self):
         with open(self.config_path) as f:
             config = json.load(f)
+        serve.logger = serve.default_logger("info")
         self.config, self.servers = serve.start(config)
-        print self.servers
+        return self
 
-    def stop(self):
+    def __exit__(self, exc_type, exc_val, exc_tb):
         for scheme, servers in self.servers.iteritems():
             for port, server in servers:
-                server.stop()
-
-    def restart(self):
-        self.stop()
-        self.start()
-
-
-def setup_environment(test_path):
-    manager = TestEnvironmentManager(test_path)
-    manager.start()
-    return manager
+                server.kill()
 
 
 def get_free_port(start_port, exclude=None):
@@ -112,78 +101,6 @@ def get_free_port(start_port, exclude=None):
         finally:
             s.close()
 
-class RunInfo(object):
-    def __init__(self, debug):
-        self.platform = mozinfo.info
-        self.debug = debug
-
-
-class Test(object):
-    def __init__(self, url, expectations, timeout=None):
-        self.url = url
-        self.expectations = expectations
-        self.timeout = timeout
-
-    @property
-    def id(self):
-        return self.url
-
-    def disabled(self, run_info):
-        if "FILE" in self.expectations:
-            return "disabled" in self.expectations["FILE"]
-
-    def expected_file(self, run_info):
-        return self.expected_subtest(run_info, "FILE")
-
-    def expected_subtest(self, run_info, name):
-        if name in self.expectations:
-            return self.expectations[name].get("expected", "PASS").upper()
-        else:
-            return "PASS"
-
-    def disabled_subtest(self, run_info, name):
-        if name in self.expectations:
-            return "disabled" in self.expectations[name]
-
-    @classmethod
-    def from_json(cls, obj):
-        raise NotImplementedError
-
-class TestharnessTest(Test):
-    @property
-    def id(self):
-        return self.url
-
-class ReftestTest(Test):
-    def __init__(self, url, ref_url, ref_type, expectations, timeout=None):
-        self.url = url
-        self.ref_url = ref_url
-        if ref_type not in ("==", "!="):
-            raise ValueError
-        self.ref_type = ref_type
-        self.expectations = expectations
-        self.timeout = timeout
-
-    @property
-    def id(self):
-        return self.url, self.ref_type, self.ref_url
-
-def construct_test(manifest_test, expectations):
-    test_cls = {"reftest":ReftestTest,
-                "testharness":TestharnessTest}[manifest_test.item_type]
-
-    timeout = LONG_TIMEOUT if manifest_test.timeout == "long" else DEFAULT_TIMEOUT
-
-    if test_cls == ReftestTest:
-        return test_cls(manifest_test.url,
-                        manifest_test.ref_url,
-                        manifest_test.ref_type,
-                        expectations,
-                        timeout=timeout)
-    else:
-        return test_cls(manifest_test.url,
-                        expectations,
-                        timeout=timeout)
 
 class HarnessResult(object):
     statuses = set(["OK", "ERROR", "TIMEOUT", "EXTERNAL-TIMEOUT", "CRASH"])
@@ -551,20 +468,21 @@ class TestRunnerManager(threading.Thread):
         #It would be nice to move this down into the runner
         file_result, test_results = results
         for result in test_results:
-            if test.disabled_subtest(result.name, self.run_info):
+            if test.disabled(self.run_info, result.name):
                 continue
-            expected = test.expected_subtest(result.name, self.run_info) == result.status
-            self.logger.test_result(test.id,
+            expected = test.expected_status(self.run_info, result.name)
+            self.logger.test_status(test.id,
                                     result.name,
                                     result.status,
                                     message=result.message,
-                                    unexpected=not expected)
+                                    unexpected=expected != result.status)
 
-        expected = test.expected_file(self.run_info) == file_result.status
+        expected = test.expected_status(self.run_info)
+        status = file_result.status if file_result.status != "EXTERNAL-TIMEOUT" else "TIMEOUT"
         self.logger.test_end(test.id,
-                             file_result.status if file_result.status != "EXTERNAL-TIMEOUT" else "TIMEOUT",
+                             status,
                              message=file_result.message,
-                             unexpected=not expected)
+                             unexpected=expected != status)
         #Restarting after a timeout is quite wasteful, but it seems otherwise we can get
         #results from the timed-out test back when we are waiting for the results of a
         #later test
@@ -592,7 +510,9 @@ class TestRunnerManager(threading.Thread):
         self.init()
 
     def on_output(self, line):
-        self.logger.info(line, {"type":"firefox-output"})
+        self.logger.process_output(line,
+                                   self.firefox_runner.process_handler.pid,
+                                   command=" ".join(self.firefox_runner.command))
 
 
 class ManagerPool(object):
@@ -641,29 +561,11 @@ class ManagerPool(object):
         self.stop_flag.set()
 
 
-def load_manifest(test_root):
-    mainfest_path = os.path.abspath(os.path.join(os.path.split(__file__)[0],
-                                                 "metadata", "MANIFEST.json"))
-
-    manifest.setup_git(test_root)
-    test_manifest = manifest.load(mainfest_path)
-    manifest.update(test_manifest)
-    return test_manifest
-
-def load_expected(test):
-    expected_root = os.path.join(os.path.split(__file__)[0], "metadata")
-    expected_path = os.path.join(expected_root, test.path + ".ini")
-    if not os.path.exists(expected_path):
-        expected_data = {}
-    else:
-        expected_data = expected.parse(expected_root, expected_path)
-    return expected_data
-
-
 def queue_tests(test_root, test_types, run_info, include_filters):
+    test_ids = []
     tests_by_type = defaultdict(Queue)
 
-    test_manifest = load_manifest(test_root)
+    test_manifest = metadata.load_manifest(test_root)
 
     for test_type in test_types:
         for test in test_manifest.itertype(test_type):
@@ -675,12 +577,12 @@ def queue_tests(test_root, test_types, run_info, include_filters):
             else:
                 queue_test = True
             if queue_test:
-                expected = load_expected(test)
-                test = construct_test(test, expected)
+                test = test_.from_manifest(test)
                 if not test.disabled(run_info):
                     tests_by_type[test_type].put(test)
+                    test_ids.append(test.id)
 
-    return tests_by_type
+    return test_ids, tests_by_type
 
 
 def abs_path(path):
@@ -727,6 +629,8 @@ def main():
     t0 = time.time()
     args = parse_args()
 
+    setup_stdlib_logger()
+
     if args.output_file:
         f = open(args.output_file, "w")
     else:
@@ -739,18 +643,14 @@ def main():
     #     socket_handler = structuredlog.SocketHandler("127.0.0.1", args.stream)
     #     logger.handlers.append(socket_handler)
 
-    pr = cProfile.Profile()
-    pr.enable()
+    run_info = test_.RunInfo(False)
 
-    run_info = RunInfo(False)
-
-    test_environment = setup_environment(args.tests_root)
-    base_server = "http://%s:%i" % (test_environment.config["host"],
-                                    test_environment.config["ports"]["http"][0])
-    try:
-        test_queues = queue_tests(args.tests_root, args.test_types, run_info,
-                                  args.include)
-        logger.tests_start(reduce(lambda x, y: x + y.qsize(), test_queues.itervalues(), 0))
+    with TestEnvironment(args.tests_root) as test_environment:
+        base_server = "http://%s:%i" % (test_environment.config["host"],
+                                        test_environment.config["ports"]["http"][0])
+        test_ids, test_queues = queue_tests(args.tests_root, args.test_types, run_info,
+                                            args.include)
+        logger.suite_start(test_ids)
         for test_type in args.test_types:
             tests_queue = test_queues[test_type]
             runner_cls = test_runner_classes[test_type]
@@ -768,14 +668,7 @@ def main():
                                process_cls=process_cls)
             pool.start(tests_queue)
             pool.wait()
-        logger.tests_end()
-    finally:
-        test_environment.stop()
-        pr.disable()
-        pr.dump_stats("profile.stats")
-        stats = pstats.Stats("profile.stats")
-        stats.sort_stats("cumtime")
-        stats.print_callers(5)
+        logger.suite_end()
 
 if __name__ == "__main__":
     main()
